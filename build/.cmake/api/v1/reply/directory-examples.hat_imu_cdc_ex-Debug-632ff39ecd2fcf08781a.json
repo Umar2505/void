@@ -1,0 +1,14 @@
+{
+	"backtraceGraph" : 
+	{
+		"commands" : [],
+		"files" : [],
+		"nodes" : []
+	},
+	"installers" : [],
+	"paths" : 
+	{
+		"build" : "examples/hat_imu_cdc_ex",
+		"source" : "examples/hat_imu_cdc_ex"
+	}
+}
