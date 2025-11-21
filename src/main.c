@@ -297,3 +297,292 @@ int main() {
     return 0;
 }
 
+// DO NOT USE THIS
+
+#include <stdio.h>
+#include <pico/stdlib.h>
+#include <math.h>
+
+#include <FreeRTOS.h>
+#include <task.h>
+#include <string.h>
+#include <tkjhat/sdk.h>
+#include <tusb.h>
+#include "usbSerialDebug/helper.h"
+
+// Default stack size for the tasks
+#define DEFAULT_STACK_SIZE 2048
+#define INPUT_BUFFER_SIZE 256
+
+// Morse code configuration
+#define DOT_DURATION_MS     200
+#define DASH_DURATION_MS    600
+#define TONE_FREQUENCY      800
+
+// IMU thresholds for detecting tilt (AX instead of AY)
+#define TILT_THRESHOLD_DOT    0.30f     // tilt forward → dot
+#define TILT_THRESHOLD_DASH  -0.30f     // tilt backward → dash
+#define TILT_DEADZONE         0.10f     // ignore small tilt noise
+
+// Maximum message length
+#define MAX_MESSAGE_LENGTH 256
+
+// Morse code states
+enum state {
+    IDLE = 0,
+    RECORDING,
+    SENDING
+};
+
+// Global variables
+static enum state programState = IDLE;
+static char dMessage[MAX_MESSAGE_LENGTH];
+static char mMessage[MAX_MESSAGE_LENGTH * 4]; // Morse is longer
+static uint16_t dMesI = 0;
+static uint16_t mMesI = 0;
+static volatile bool btn1_pressed = false;
+static volatile bool btn2_pressed = false;
+
+// Morse code lookup table
+typedef struct {
+    char character;
+    const char* code;
+} MorseCode;
+
+static const MorseCode morseTable[] = {
+    {'A', ".-"},    {'B', "-..."},  {'C', "-.-."},  {'D', "-.."},
+    {'E', "."},     {'F', "..-."},  {'G', "--."},   {'H', "...."},
+    {'I', ".."},    {'J', ".---"},  {'K', "-.-"},   {'L', ".-.."},
+    {'M', "--"},    {'N', "-."},    {'O', "---"},   {'P', ".--."},
+    {'Q', "--.-"},  {'R', ".-."},   {'S', "..."},   {'T', "-"},
+    {'U', "..-"},   {'V', "...-"},  {'W', ".--"},   {'X', "-..-"},
+    {'Y', "-.--"},  {'Z', "--.."},
+    {'0', "-----"}, {'1', ".----"}, {'2', "..---"}, {'3', "...--"},
+    {'4', "....-"}, {'5', "....."}, {'6', "-...."}, {'7', "--..."},
+    {'8', "---.."}, {'9', "----."},
+    {' ', "/"}  // space
+};
+
+// Convert morse code string to character
+static char morse_to_char(const char* morse) {
+    if (morse[0] == '/') return ' ';
+
+    for (int i = 0; i < sizeof(morseTable) / sizeof(MorseCode); i++) {
+        if (strcmp(morse, morseTable[i].code) == 0) {
+            return morseTable[i].character;
+        }
+    }
+    return '?'; // Unknown
+}
+
+// Button interrupt handler
+static void btn_fxn(uint gpio, uint32_t eventMask) {
+    if (gpio == BUTTON1)
+        btn1_pressed = true;
+    else if (gpio == BUTTON2)
+        btn2_pressed = true;
+}
+
+void imu_task(void *pvParameters) {
+    (void) pvParameters;
+
+    float ax, ay, az, gx, gy, gz, t;
+
+    char currentMorse[10] = "";
+    uint8_t morsePos = 0;
+
+    init_ICM42670();
+    init_display();
+
+    while (1) {
+
+        // BTN1 → Start/stop recording
+        if (btn1_pressed) {
+            btn1_pressed = false;
+
+            if (programState == IDLE) {
+
+                programState = RECORDING;
+
+                dMesI = 0;
+                mMesI = 0;
+                morsePos = 0;
+
+                memset(dMessage, 0, MAX_MESSAGE_LENGTH);
+                memset(mMessage, 0, MAX_MESSAGE_LENGTH * 4);
+                memset(currentMorse, 0, sizeof(currentMorse));
+
+                // Blink LED (3x)
+                for (int i = 0; i < 3; i++) {
+                    set_led_status(true);
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                    set_led_status(false);
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                }
+            }
+            else if (programState == RECORDING) {
+
+                // Finish last character
+                if (morsePos > 0) {
+                    currentMorse[morsePos] = '\0';
+                    char decoded = morse_to_char(currentMorse);
+                    dMessage[dMesI++] = decoded;
+
+                    memcpy(&mMessage[mMesI], currentMorse, morsePos);
+                    mMesI += morsePos;
+                    mMessage[mMesI++] = ' ';
+                }
+
+                // Output message
+                dMessage[dMesI] = '\0';
+                mMessage[mMesI] = '\0';
+
+                clear_display();
+                write_text("Morse:");
+                vTaskDelay(pdMS_TO_TICKS(800));
+
+                clear_display();
+                write_text(mMessage);
+                usb_serial_print(mMessage);
+                usb_serial_flush();
+
+                vTaskDelay(pdMS_TO_TICKS(1500));
+
+                clear_display();
+                write_text("Text:");
+                vTaskDelay(pdMS_TO_TICKS(800));
+
+                clear_display();
+                write_text(dMessage);
+
+                buzzer_play_tone(TONE_FREQUENCY, 1000);
+
+                programState = IDLE;
+            }
+        }
+
+        // BTN2 → End of letter
+        if (btn2_pressed && programState == RECORDING) {
+            btn2_pressed = false;
+
+            if (morsePos > 0) {
+                currentMorse[morsePos] = '\0';
+                char decoded = morse_to_char(currentMorse);
+
+                dMessage[dMesI++] = decoded;
+
+                memcpy(&mMessage[mMesI], currentMorse, morsePos);
+                mMesI += morsePos;
+                mMessage[mMesI++] = ' ';
+
+                memset(currentMorse, 0, sizeof(currentMorse));
+                morsePos = 0;
+
+                buzzer_play_tone(TONE_FREQUENCY / 2, 120);
+            }
+        }
+
+        // IMU reading only during RECORDING
+        if (programState == RECORDING) {
+
+            if (ICM42670_read_sensor_data(&ax, &ay, &az, &gx, &gy, &gz, &t) == 0) {
+
+                float tilt = ax;   // ← IMPORTANT: use AX
+
+                // Ignore small IMU noise
+                if (fabs(tilt) < TILT_DEADZONE) {
+                    vTaskDelay(pdMS_TO_TICKS(50));
+                    continue;
+                }
+
+                // DOT (tilt forward)
+                if (tilt > TILT_THRESHOLD_DOT && morsePos < 9) {
+                    currentMorse[morsePos++] = '.';
+
+                    clear_display();
+                    write_text(".");
+                    buzzer_play_tone(TONE_FREQUENCY, DOT_DURATION_MS);
+
+                    set_led_status(true);
+                    vTaskDelay(pdMS_TO_TICKS(DOT_DURATION_MS));
+                    set_led_status(false);
+
+                    vTaskDelay(pdMS_TO_TICKS(300)); // wait for neutral
+                }
+                // DASH (tilt backward)
+                else if (tilt < TILT_THRESHOLD_DASH && morsePos < 9) {
+                    currentMorse[morsePos++] = '-';
+
+                    clear_display();
+                    write_text("-");
+                    buzzer_play_tone(TONE_FREQUENCY, DASH_DURATION_MS);
+
+                    set_led_status(true);
+                    vTaskDelay(pdMS_TO_TICKS(DASH_DURATION_MS));
+                    set_led_status(false);
+
+                    vTaskDelay(pdMS_TO_TICKS(300));
+                }
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+// ---- Task running USB stack ----
+static void usbTask(void *arg) {
+    (void)arg;
+    while (1) {
+        tud_task();              // With FreeRTOS wait for events
+                                 // Do not add vTaskDelay. 
+    }
+}
+
+int main() {
+    stdio_init_all();
+
+    init_hat_sdk();
+    sleep_ms(300);
+
+    init_led();
+    init_sw1();
+    init_sw2();
+    init_buzzer();
+
+    gpio_set_irq_enabled_with_callback(BUTTON1, GPIO_IRQ_EDGE_RISE, true, btn_fxn);
+    gpio_set_irq_enabled_with_callback(BUTTON2, GPIO_IRQ_EDGE_RISE, true, btn_fxn);
+
+    TaskHandle_t IMUTask = NULL;
+    TaskHandle_t hUsb = NULL;
+
+    if (xTaskCreate(
+            imu_task,
+            "IMUTask",
+            DEFAULT_STACK_SIZE,
+            NULL,
+            2,
+            &IMUTask) != pdPASS) {
+        return -1;
+    }
+
+    if (xTaskCreate(
+            usbTask,
+            "usb",
+            DEFAULT_STACK_SIZE,
+            NULL,
+            3,
+            &hUsb) != pdPASS) {
+        return -1;
+    }
+
+    tusb_init();
+    //Initialize helper library to write in CDC0)
+    usb_serial_init();
+
+    vTaskStartScheduler();
+
+    return 0;
+}
+
+
